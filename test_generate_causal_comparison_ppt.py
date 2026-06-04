@@ -8,6 +8,7 @@ from generate_causal_comparison_ppt import (
     load_ground_truth_matrix,
     load_square_matrix_npz,
     load_var_ground_truth_matrix,
+    resolve_real_fmri_network_path,
 )
 
 
@@ -58,6 +59,32 @@ class VarGroundTruthLoadingTest(unittest.TestCase):
                 dtype=np.float32,
             )
             np.testing.assert_array_equal(loaded, expected)
+
+
+class RealFmriNetworkPathTest(unittest.TestCase):
+    def test_resolve_real_fmri_network_path_auto_prefers_ei(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_root = Path(temp_dir)
+            ei_path = result_root / "ei_causal_graph_scale1.csv"
+            jacobian_path = result_root / "jacobian_mean_abs_scale1.csv"
+            ei_path.write_text("0.1\n", encoding="utf-8")
+            jacobian_path.write_text("0.2\n", encoding="utf-8")
+
+            resolved_path, resolved_kind = resolve_real_fmri_network_path(result_root, 1, "auto")
+
+            self.assertEqual(resolved_path, ei_path)
+            self.assertEqual(resolved_kind, "ei")
+
+    def test_resolve_real_fmri_network_path_can_select_jacobian(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_root = Path(temp_dir)
+            jacobian_path = result_root / "jacobian_mean_abs_scale1.csv"
+            jacobian_path.write_text("0.2\n", encoding="utf-8")
+
+            resolved_path, resolved_kind = resolve_real_fmri_network_path(result_root, 1, "jacobian")
+
+            self.assertEqual(resolved_path, jacobian_path)
+            self.assertEqual(resolved_kind, "jacobian")
 
 
 if __name__ == "__main__":

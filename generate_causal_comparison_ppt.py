@@ -33,6 +33,11 @@ ROI_COLORS = {
     "RAG": "#14b8a6",
 }
 
+DEFAULT_COMPARE_RESULT_DIR = "result/lorenz"
+DEFAULT_COMPARE_RUN_NAME = "stage2_lorenz_macro"
+DEFAULT_REAL_FMRI_RESULT_DIR = "result/real_fmri"
+DEFAULT_REAL_FMRI_RUN_NAME = "stage2_real_fmri_macro"
+
 
 def build_macro_lorenz96_adjacency(num_nodes):
     adjacency = np.zeros((num_nodes, num_nodes), dtype=np.float32)
@@ -451,9 +456,70 @@ def load_jacobian_summary(summary_path):
     return pd.read_csv(summary_path).iloc[0].to_dict()
 
 
+def resolve_mode_default(value, old_default, mode_default):
+    if str(value).strip() == str(old_default):
+        return mode_default
+    return value
+
+
 def resolve_saved_scale_number(scale_id):
     # Training uses zero-based logical scale ids, while saved artifacts use one-based file names.
     return int(scale_id) + 1
+
+
+def resolve_real_fmri_network_path(result_root, saved_scale, network_kind="auto", network_path="", sample_count_tag=2000):
+    if network_path:
+        return Path(network_path), "custom"
+
+    result_root = Path(result_root)
+    network_kind = str(network_kind or "auto").strip().lower()
+    candidate_specs = []
+    if network_kind in {"auto", "ei"}:
+        candidate_specs.append(("ei", result_root / f"ei_causal_graph_scale{saved_scale}.csv"))
+    if network_kind in {"auto", "jacobian"}:
+        candidate_specs.append(("jacobian", result_root / f"jacobian_mean_abs_scale{saved_scale}.csv"))
+    if network_kind in {"auto", "jacobian_realdata"}:
+        candidate_specs.append(
+            (
+                "jacobian_realdata",
+                result_root / f"jacobian_mean_abs_realdata{sample_count_tag}_scale{saved_scale}.csv",
+            )
+        )
+    if not candidate_specs:
+        raise ValueError(f"Unsupported real-fMRI network_kind: {network_kind}")
+
+    for resolved_kind, candidate_path in candidate_specs:
+        if candidate_path.exists():
+            return candidate_path, resolved_kind
+
+    candidate_text = ", ".join(str(path) for _, path in candidate_specs)
+    raise FileNotFoundError(f"No real-fMRI inferred network file found. Tried: {candidate_text}")
+
+
+def resolve_real_fmri_metadata_path(result_root, saved_scale, network_kind, sample_count_tag=2000):
+    result_root = Path(result_root)
+    network_kind = str(network_kind or "").strip().lower()
+    candidates = []
+    if network_kind == "ei":
+        candidates.append(result_root / f"pairwise_ei_summary_scale{saved_scale}.csv")
+    if network_kind == "jacobian_realdata":
+        candidates.append(result_root / f"jacobian_mean_abs_realdata{sample_count_tag}_scale{saved_scale}_summary.csv")
+    candidates.append(result_root / f"summary_scale{saved_scale}.csv")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def network_kind_label(network_kind):
+    labels = {
+        "ei": "EI",
+        "jacobian": "Jacobian",
+        "jacobian_realdata": "Jacobian",
+        "custom": "Custom",
+    }
+    return labels.get(str(network_kind).strip().lower(), "Inferred")
 
 
 def build_edge_records(causal_graph_strength):
@@ -507,7 +573,14 @@ def draw_directed_edge(ax, source_xy, target_xy, strength_norm, color):
     ax.add_patch(patch)
 
 
-def create_inferred_network_figure(causal_graph_strength, output_png, source_name, metadata=None):
+def create_inferred_network_figure(
+    causal_graph_strength,
+    output_png,
+    source_name,
+    metadata=None,
+    network_title="Jacobian-Inferred Causal Network Across 7 ROIs",
+    colorbar_label="Inferred causal strength",
+):
     metadata = metadata or {}
     edge_records = build_edge_records(causal_graph_strength)
     norm = compute_edge_normalizer(edge_records)
@@ -521,7 +594,7 @@ def create_inferred_network_figure(causal_graph_strength, output_png, source_nam
     title_ax.text(
         0.5,
         0.72,
-        "Jacobian-Inferred Causal Network Across 7 ROIs",
+        network_title,
         ha="center",
         va="center",
         fontsize=24,
@@ -611,8 +684,77 @@ def create_inferred_network_figure(causal_graph_strength, output_png, source_nam
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     colorbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.04)
-    colorbar.set_label("Inferred causal strength", fontsize=11)
+    colorbar.set_label(colorbar_label, fontsize=11)
     colorbar.ax.tick_params(labelsize=10)
+
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def create_inferred_heatmap_figure(
+    causal_graph_strength,
+    output_png,
+    source_name,
+    metadata=None,
+    network_title="Inferred Causal Network Heatmap",
+    colorbar_label="Inferred causal strength",
+):
+    metadata = metadata or {}
+    causal_graph_strength = np.asarray(causal_graph_strength, dtype=np.float32)
+    macro_size = int(causal_graph_strength.shape[0])
+    node_labels = ROI_LABELS if macro_size == len(ROI_LABELS) else [f"M{i + 1}" for i in range(macro_size)]
+
+    fig = plt.figure(figsize=(10.5, 8.0), dpi=150, facecolor="white")
+    gs = fig.add_gridspec(2, 1, height_ratios=[0.18, 0.82])
+
+    title_ax = fig.add_subplot(gs[0, 0])
+    title_ax.axis("off")
+    title_ax.text(
+        0.5,
+        0.72,
+        network_title,
+        ha="center",
+        va="center",
+        fontsize=22,
+        fontweight="bold",
+        color="#1f2933",
+    )
+    sample_count = metadata.get("sample_count")
+    subject_count = metadata.get("subject_count")
+    sample_text = "" if sample_count is None else f"    Samples: {int(sample_count)}"
+    subject_text = "" if subject_count is None else f"    Subjects: {int(subject_count)}"
+    title_ax.text(
+        0.5,
+        0.28,
+        f"Source: {source_name}{sample_text}{subject_text}    Edge direction: source -> target",
+        ha="center",
+        va="center",
+        fontsize=11.5,
+        color="#52606d",
+    )
+
+    ax = fig.add_subplot(gs[1, 0])
+    vmin, vmax = _heatmap_limits(causal_graph_strength)
+    sns.heatmap(
+        causal_graph_strength,
+        ax=ax,
+        cmap="YlOrRd",
+        vmin=vmin,
+        vmax=vmax,
+        square=True,
+        linewidths=0.8,
+        linecolor="white",
+        xticklabels=node_labels,
+        yticklabels=node_labels,
+        annot=macro_size <= 10,
+        fmt=".2g",
+        cbar=True,
+        cbar_kws={"shrink": 0.82, "label": colorbar_label},
+    )
+    ax.set_xlabel("Source macro variable", fontsize=11)
+    ax.set_ylabel("Target macro variable", fontsize=11)
+    ax.set_title(f"{macro_size} x {macro_size} inferred matrix", fontsize=13, fontweight="bold")
 
     fig.tight_layout()
     fig.savefig(output_png, dpi=150, bbox_inches="tight", facecolor="white")
@@ -850,29 +992,56 @@ def run_compare_mode(args):
 
 
 def run_real_fmri_roi_mode(args):
-    result_dir = Path(args.result_dir)
+    result_dir = Path(resolve_mode_default(args.result_dir, DEFAULT_COMPARE_RESULT_DIR, DEFAULT_REAL_FMRI_RESULT_DIR))
     result_dir.mkdir(parents=True, exist_ok=True)
-    result_root = Path(args.loc_result_dir) / args.run_name
+    run_name = resolve_mode_default(args.run_name, DEFAULT_COMPARE_RUN_NAME, DEFAULT_REAL_FMRI_RUN_NAME)
+    result_root = Path(args.loc_result_dir) / run_name
     saved_scale = resolve_saved_scale_number(args.scale_id)
 
-    causal_graph_path = result_root / f"jacobian_mean_abs_realdata{args.sample_count_tag}_scale{saved_scale}.csv"
-    summary_path = result_root / f"jacobian_mean_abs_realdata{args.sample_count_tag}_scale{saved_scale}_summary.csv"
-    causal_graph_strength = load_causal_graph(causal_graph_path)
-    metadata = load_jacobian_summary(summary_path)
-
-    output_png = result_dir / f"inferred_causal_network_scale{saved_scale}.png"
-    output_pptx = result_dir / f"inferred_causal_network_scale{saved_scale}.pptx"
-    deck_title = f"Jacobian-Inferred Causal Network Across 7 ROIs (Scale {saved_scale})"
-
-    create_inferred_network_figure(
-        causal_graph_strength,
-        output_png,
-        causal_graph_path.name,
-        metadata=metadata,
+    causal_graph_path, resolved_network_kind = resolve_real_fmri_network_path(
+        result_root=result_root,
+        saved_scale=saved_scale,
+        network_kind=args.network_kind,
+        network_path=args.network_path,
+        sample_count_tag=args.sample_count_tag,
     )
+    summary_path = resolve_real_fmri_metadata_path(
+        result_root=result_root,
+        saved_scale=saved_scale,
+        network_kind=resolved_network_kind,
+        sample_count_tag=args.sample_count_tag,
+    )
+    causal_graph_strength = load_square_matrix_csv(causal_graph_path, f"{resolved_network_kind}_network")
+    metadata = load_jacobian_summary(summary_path)
+    label = network_kind_label(resolved_network_kind)
+
+    output_png = result_dir / f"inferred_{resolved_network_kind}_causal_network_scale{saved_scale}.png"
+    output_pptx = result_dir / f"inferred_{resolved_network_kind}_causal_network_scale{saved_scale}.pptx"
+    deck_title = f"{label}-Inferred Causal Network (Scale {saved_scale})"
+
+    if causal_graph_strength.shape == (len(ROI_LABELS), len(ROI_LABELS)):
+        create_inferred_network_figure(
+            causal_graph_strength,
+            output_png,
+            causal_graph_path.name,
+            metadata=metadata,
+            network_title=f"{label}-Inferred Causal Network Across 7 ROIs",
+            colorbar_label=f"{label} causal strength",
+        )
+    else:
+        create_inferred_heatmap_figure(
+            causal_graph_strength,
+            output_png,
+            causal_graph_path.name,
+            metadata=metadata,
+            network_title=f"{label}-Inferred Macro Network Heatmap",
+            colorbar_label=f"{label} causal strength",
+        )
     image_bytes = output_png.read_bytes()
     build_minimal_pptx(image_bytes, output_png.name, output_pptx, deck_title)
 
+    print(f"Loaded real-fMRI network from {causal_graph_path}")
+    print(f"Loaded metadata from {summary_path}")
     print(f"Saved inferred causal network image to {output_png}")
     print(f"Saved PPT to {output_pptx}")
 
@@ -883,10 +1052,12 @@ def main():
     )
     parser.add_argument("--mode", type=str, default="compare", choices=["compare", "var_compare", "real_fmri_roi"])
     parser.add_argument("--scale_id", type=int, default=0)
-    parser.add_argument("--result_dir", type=str, default="result/lorenz")
+    parser.add_argument("--result_dir", type=str, default=DEFAULT_COMPARE_RESULT_DIR)
     parser.add_argument("--loc_result_dir", type=str, default="loc_result_stage2")
-    parser.add_argument("--run_name", type=str, default="stage2_lorenz_macro")
+    parser.add_argument("--run_name", type=str, default=DEFAULT_COMPARE_RUN_NAME)
     parser.add_argument("--sample_count_tag", type=int, default=2000)
+    parser.add_argument("--network_kind", type=str, default="auto", choices=["auto", "ei", "jacobian", "jacobian_realdata"])
+    parser.add_argument("--network_path", type=str, default="")
     parser.add_argument("--ground_truth_path", type=str, default="")
     parser.add_argument("--var_data_path", type=str, default="loc_data_var/generated_data.npz")
     parser.add_argument("--var_ground_truth_key", type=str, default="causal_matrix")
