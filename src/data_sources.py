@@ -279,9 +279,9 @@ def add_data_source_args(parser):
     
     parser.add_argument("--kuramoto_sz", type=int, default=32)
     parser.add_argument("--kuramoto_groups", type=int, default=2)
-    parser.add_argument("--kuramoto_num_series", type=int, default=1)
-    parser.add_argument("--kuramoto_time_steps", type=int, default=100000)
-    parser.add_argument("--kuramoto_dt", type=float, default=0.05)
+    parser.add_argument("--kuramoto_num_series", type=int, default=50)
+    parser.add_argument("--kuramoto_time_steps", type=int, default=5000)
+    parser.add_argument("--kuramoto_dt", type=float, default=0.01)
     parser.add_argument("--kuramoto_sample_interval", type=int, default=1)
     parser.add_argument(
         "--kuramoto_intra_coupling_strength",

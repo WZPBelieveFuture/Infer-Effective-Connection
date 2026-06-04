@@ -267,7 +267,7 @@ def generate_kuramoto_data(config):
                 rng=rng,
             )
             omegas = rng.standard_normal(int(config.sz)).astype(np.float32)
-
+            
             trajectory, theta_history = _simulate_single_series(
                 obj_matrix=obj_matrix,
                 group_matrix=group_matrix,

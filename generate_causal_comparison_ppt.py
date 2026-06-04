@@ -62,6 +62,55 @@ def load_square_matrix_csv(matrix_path, matrix_name):
     raise ValueError(f"{matrix_name} must be a square matrix CSV. Tried shapes: {shapes}")
 
 
+def load_square_matrix_npz(npz_path, key, matrix_name):
+    npz_path = Path(npz_path)
+    if not npz_path.exists():
+        raise FileNotFoundError(f"{matrix_name} file not found: {npz_path}")
+
+    with np.load(npz_path, allow_pickle=False) as archive:
+        if key not in archive:
+            available = ", ".join(archive.files)
+            raise KeyError(
+                f"{matrix_name} key '{key}' was not found in {npz_path}. "
+                f"Available keys: {available}"
+            )
+        values = np.asarray(archive[key], dtype=np.float32)
+
+    if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        raise ValueError(f"{matrix_name} must be a square matrix. Got shape {values.shape}.")
+    return values
+
+
+def load_ground_truth_matrix(matrix_path, matrix_name="ground_truth", npz_key="causal_matrix"):
+    matrix_path = Path(matrix_path)
+    suffix = matrix_path.suffix.lower()
+    if suffix == ".npz":
+        return load_square_matrix_npz(matrix_path, npz_key, matrix_name)
+    return load_square_matrix_csv(matrix_path, matrix_name)
+
+
+def load_var_ground_truth_matrix(npz_path, expected_shape, npz_key="causal_matrix"):
+    npz_path = Path(npz_path)
+    group_ground_truth = load_square_matrix_npz(npz_path, npz_key, "var_ground_truth")
+    expected_shape = tuple(int(dim) for dim in expected_shape)
+    if group_ground_truth.shape == expected_shape:
+        return group_ground_truth
+
+    with np.load(npz_path, allow_pickle=False) as archive:
+        group = np.asarray(archive["group"], dtype=np.int64).reshape(-1) if "group" in archive else None
+
+    if group is not None:
+        observed_size = int(group.sum())
+        observed_shape = (observed_size, observed_size)
+        if group_ground_truth.shape == (len(group), len(group)) and expected_shape == observed_shape:
+            return np.repeat(np.repeat(group_ground_truth, group, axis=0), group, axis=1).astype(np.float32)
+
+    raise ValueError(
+        "var_ground_truth must match the inferred matrix shape, or be expandable with the "
+        f"npz group field. Got ground_truth {group_ground_truth.shape} and inferred {expected_shape}."
+    )
+
+
 def compute_auc_score(labels, scores):
     labels = np.asarray(labels, dtype=bool).reshape(-1)
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
@@ -154,6 +203,9 @@ def create_lorzen_comparison_figure(
     metrics_by_name,
     output_png,
     scale_number,
+    comparison_title="Lorzen Causal Graph Comparison",
+    comparison_subtitle="Comparing jacobian_mean_abs, ei_causal_graph, and Lorenz-96 groundtruth. Edge direction: source -> target.",
+    ground_truth_title="Groundtruth Lorenz-96",
 ):
     macro_size = int(ground_truth.shape[0])
     node_labels = [f"M{i + 1}" for i in range(macro_size)]
@@ -166,7 +218,7 @@ def create_lorzen_comparison_figure(
     title_ax.text(
         0.5,
         0.72,
-        f"Lorzen Causal Graph Comparison (Scale {scale_number})",
+        f"{comparison_title} (Scale {scale_number})",
         ha="center",
         va="center",
         fontsize=24,
@@ -176,7 +228,7 @@ def create_lorzen_comparison_figure(
     title_ax.text(
         0.5,
         0.25,
-        "Comparing jacobian_mean_abs, ei_causal_graph, and Lorenz-96 groundtruth. Edge direction: source -> target.",
+        comparison_subtitle,
         ha="center",
         va="center",
         fontsize=12,
@@ -202,7 +254,7 @@ def create_lorzen_comparison_figure(
         ),
         (
             ground_truth,
-            "Groundtruth Lorenz-96",
+            ground_truth_title,
             None,
             "Blues",
             "Groundtruth edge",
@@ -715,7 +767,8 @@ def run_compare_mode(args):
     result_dir.mkdir(parents=True, exist_ok=True)
     result_root = Path(args.loc_result_dir) / args.run_name
     saved_scale = resolve_saved_scale_number(args.scale_id)
-
+    is_var_compare = str(args.mode).strip().lower() == "var_compare"
+    
     jacobian_path = result_root / f"jacobian_mean_abs_scale{saved_scale}.csv"
     causal_graph_path = result_root / f"ei_causal_graph_scale{saved_scale}.csv"
     summary_path = result_root / f"summary_scale{saved_scale}.csv"
@@ -729,15 +782,27 @@ def run_compare_mode(args):
             f"Got {jacobian_strength.shape} and {causal_graph_strength.shape}."
         )
 
-    if args.ground_truth_path:
-        ground_truth = load_square_matrix_csv(args.ground_truth_path, "ground_truth")
-        if ground_truth.shape != causal_graph_strength.shape:
-            raise ValueError(
-                "ground_truth must have the same shape as the inferred matrices. "
-                f"Got {ground_truth.shape} and {causal_graph_strength.shape}."
-            )
+    if is_var_compare:
+        ground_truth_path = args.ground_truth_path or args.var_data_path
+        ground_truth = load_var_ground_truth_matrix(
+            ground_truth_path,
+            causal_graph_strength.shape,
+            args.var_ground_truth_key,
+        )
+    elif args.ground_truth_path:
+        ground_truth = load_ground_truth_matrix(
+            args.ground_truth_path,
+            "ground_truth",
+            args.var_ground_truth_key,
+        )
     else:
         ground_truth = build_macro_lorenz96_adjacency(causal_graph_strength.shape[0])
+
+    if ground_truth.shape != causal_graph_strength.shape:
+        raise ValueError(
+            "ground_truth must have the same shape as the inferred matrices. "
+            f"Got {ground_truth.shape} and {causal_graph_strength.shape}."
+        )
 
     history_df = pd.read_csv(history_path)
     metrics_by_name = {
@@ -745,8 +810,21 @@ def run_compare_mode(args):
         "ei": compute_threshold_metrics(causal_graph_strength, ground_truth),
     }
 
-    output_png = result_dir / f"lorzen_causal_graph_comparison_scale{saved_scale}.png"
-    output_pptx = result_dir / f"lorzen_causal_graph_comparison_scale{saved_scale}.pptx"
+    comparison_prefix = "var" if is_var_compare else "lorzen"
+    comparison_title = "VAR Causal Graph Comparison" if is_var_compare else "Lorzen Causal Graph Comparison"
+    ground_truth_title = "Groundtruth VAR" if is_var_compare else "Groundtruth Lorenz-96"
+    ground_truth_source = (
+        f"VAR groundtruth from {ground_truth_path}"
+        if is_var_compare
+        else "Lorenz-96 groundtruth"
+    )
+    comparison_subtitle = (
+        "Comparing jacobian_mean_abs, ei_causal_graph, and "
+        f"{ground_truth_source}. Edge direction: source -> target."
+    )
+    
+    output_png = result_dir / f"{comparison_prefix}_causal_graph_comparison_scale{saved_scale}.png"
+    output_pptx = result_dir / f"{comparison_prefix}_causal_graph_comparison_scale{saved_scale}.pptx"
     history_png = result_dir / f"training_history_scale{saved_scale}.png"
 
     create_lorzen_comparison_figure(
@@ -756,12 +834,15 @@ def run_compare_mode(args):
         metrics_by_name=metrics_by_name,
         output_png=output_png,
         scale_number=saved_scale,
+        comparison_title=comparison_title,
+        comparison_subtitle=comparison_subtitle,
+        ground_truth_title=ground_truth_title,
     )
     create_training_history_figure(history_df, history_png)
     image_bytes = output_png.read_bytes()
-    build_minimal_pptx(image_bytes, output_png.name, output_pptx, "Lorzen Causal Graph Comparison")
+    build_minimal_pptx(image_bytes, output_png.name, output_pptx, comparison_title)
 
-    print(f"Saved Lorzen comparison image to {output_png}")
+    print(f"Saved {comparison_prefix} comparison image to {output_png}")
     print(f"Saved PPT to {output_pptx}")
     print(f"Saved training history image to {history_png}")
     print(f"Jacobian metrics: {format_metric_text(metrics_by_name['jacobian'])}")
@@ -798,18 +879,20 @@ def run_real_fmri_roi_mode(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create PPT figures for Lorenz-style causal comparisons or real-fMRI ROI causal networks."
+        description="Create PPT figures for Lorenz/VAR causal comparisons or real-fMRI ROI causal networks."
     )
-    parser.add_argument("--mode", type=str, default="compare", choices=["compare", "real_fmri_roi"])
+    parser.add_argument("--mode", type=str, default="compare", choices=["compare", "var_compare", "real_fmri_roi"])
     parser.add_argument("--scale_id", type=int, default=0)
-    parser.add_argument("--result_dir", type=str, default="result")
+    parser.add_argument("--result_dir", type=str, default="result/lorenz")
     parser.add_argument("--loc_result_dir", type=str, default="loc_result_stage2")
-    parser.add_argument("--run_name", type=str, default="stage2_lorzen_macro")
+    parser.add_argument("--run_name", type=str, default="stage2_lorenz_macro")
     parser.add_argument("--sample_count_tag", type=int, default=2000)
     parser.add_argument("--ground_truth_path", type=str, default="")
+    parser.add_argument("--var_data_path", type=str, default="loc_data_var/generated_data.npz")
+    parser.add_argument("--var_ground_truth_key", type=str, default="causal_matrix")
     args = parser.parse_args()
 
-    if args.mode == "compare":
+    if args.mode in {"compare", "var_compare"}:
         run_compare_mode(args)
         return
     run_real_fmri_roi_mode(args)
