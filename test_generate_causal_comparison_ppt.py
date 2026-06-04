@@ -5,10 +5,12 @@ from pathlib import Path
 import numpy as np
 
 from generate_causal_comparison_ppt import (
+    compute_threshold_metrics,
     load_ground_truth_matrix,
     load_square_matrix_npz,
     load_var_ground_truth_matrix,
 )
+from compute_var_transport_ei import aggregate_group_transport_ei
 
 
 class VarGroundTruthLoadingTest(unittest.TestCase):
@@ -21,6 +23,53 @@ class VarGroundTruthLoadingTest(unittest.TestCase):
             loaded = load_square_matrix_npz(npz_path, "causal_matrix", "var_ground_truth")
 
             np.testing.assert_array_equal(loaded, expected)
+
+
+class TransportMapEITest(unittest.TestCase):
+    def test_aggregate_group_transport_ei_outputs_nonnegative_ei(self):
+        transport_jacobians = np.full((3, 2, 3), 0.01, dtype=np.float32)
+        group_sizes = np.array([2, 1], dtype=np.int64)
+        sigma_diag = np.array([0.1, 0.1], dtype=np.float32)
+
+        transport_ei, _, _, _ = aggregate_group_transport_ei(
+            transport_jacobians,
+            group_sizes=group_sizes,
+            sigma_diag=sigma_diag,
+            L=1.0,
+            eps=1e-12,
+        )
+
+        self.assertGreaterEqual(float(transport_ei.min()), 0.0)
+
+    def test_transport_ei_keeps_jacobian_separable_edges_separable(self):
+        transport_jacobians = np.array(
+            [
+                [
+                    [0.20, 0.10],
+                    [0.19, 0.20],
+                ],
+                [
+                    [0.20, 0.10],
+                    [0.19, 0.20],
+                ],
+            ],
+            dtype=np.float32,
+        )
+        group_sizes = np.array([1, 1], dtype=np.int64)
+        sigma_diag = np.array([100.0, 0.001], dtype=np.float32)
+        ground_truth = np.eye(2, dtype=np.float32)
+
+        transport_ei, mean_group_gain, _, _ = aggregate_group_transport_ei(
+            transport_jacobians,
+            group_sizes=group_sizes,
+            sigma_diag=sigma_diag,
+            L=1.0,
+            eps=1e-12,
+        )
+
+        jacobian_metrics = compute_threshold_metrics(mean_group_gain, ground_truth)
+        ei_metrics = compute_threshold_metrics(transport_ei, ground_truth)
+        self.assertGreaterEqual(ei_metrics["f1"], jacobian_metrics["f1"])
 
     def test_load_square_matrix_npz_requires_square_matrix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
